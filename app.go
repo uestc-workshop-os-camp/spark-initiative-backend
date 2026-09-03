@@ -86,7 +86,7 @@ func (a *application) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Query().Get("error") != "" {
-		http.Redirect(w, r, "/camp/?auth=denied", http.StatusFound)
+		http.Redirect(w, r, "/os/?auth=denied", http.StatusFound)
 		return
 	}
 	code := r.URL.Query().Get("code")
@@ -100,7 +100,7 @@ func (a *application) callback(w http.ResponseWriter, r *http.Request) {
 	user, err := a.github.ExchangeUser(ctx, code, saved.Verifier, redirect)
 	if err != nil {
 		a.logger.Warn("GitHub login failed", "error", err)
-		http.Redirect(w, r, "/camp/?auth=failed", http.StatusFound)
+		http.Redirect(w, r, "/os/?auth=failed", http.StatusFound)
 		return
 	}
 	expires := a.now().Add(30 * time.Minute)
@@ -113,7 +113,7 @@ func (a *application) callback(w http.ResponseWriter, r *http.Request) {
 		Name: sessionCookieName, Value: value, Path: basePath + "/",
 		Expires: expires, MaxAge: 1800, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	})
-	http.Redirect(w, r, "/camp/", http.StatusFound)
+	http.Redirect(w, r, "/os/", http.StatusFound)
 }
 
 type sessionHandler func(http.ResponseWriter, *http.Request, sessionCookie, string)
