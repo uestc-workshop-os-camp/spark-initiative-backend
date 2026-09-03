@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,7 @@ func newApplication(cfg config, store claimStore, github githubService, logger *
 	app.mux.HandleFunc("POST "+basePath+"/auth/logout", app.withSession(app.logout))
 	app.mux.HandleFunc("GET "+basePath+"/state", app.withSession(app.state))
 	app.mux.HandleFunc("POST "+basePath+"/claim/{phase}", app.withSession(app.claim))
+	app.mux.HandleFunc("POST "+basePath+"/claim/{phase}/recreate", app.withSession(app.recreate))
 	return app
 }
 
@@ -167,14 +169,7 @@ func (a *application) state(w http.ResponseWriter, r *http.Request, session sess
 }
 
 func (a *application) claim(w http.ResponseWriter, r *http.Request, session sessionCookie, rawSession string) {
-	if !a.validMutation(r, rawSession) {
-		writeError(w, http.StatusForbidden, "csrf_failed", "invalid request origin or CSRF token")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1024)
-	body, err := io.ReadAll(r.Body)
-	if err != nil || strings.TrimSpace(string(body)) != "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "claim request body must be empty")
+	if !a.validEmptyMutation(w, r, rawSession) {
 		return
 	}
 	p, ok := a.cfg.Phases[r.PathValue("phase")]
@@ -226,6 +221,74 @@ func (a *application) claim(w http.ResponseWriter, r *http.Request, session sess
 	writeJSON(w, http.StatusOK, map[string]any{
 		"claim": claimView(item, status),
 	})
+}
+
+func (a *application) recreate(w http.ResponseWriter, r *http.Request, session sessionCookie, rawSession string) {
+	if !a.validEmptyMutation(w, r, rawSession) {
+		return
+	}
+	p, ok := a.cfg.Phases[r.PathValue("phase")]
+	if !ok {
+		writeError(w, http.StatusNotFound, "phase_not_found", "course phase was not found")
+		return
+	}
+	if !p.Enabled {
+		writeError(w, http.StatusConflict, "phase_closed", "course phase is not open")
+		return
+	}
+	item, err := a.store.Find(r.Context(), session.GitHubID, p.Key)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && item.RepoID <= 0) {
+		writeError(w, http.StatusConflict, "claim_incomplete", "repository has not been created")
+		return
+	}
+	if err != nil {
+		a.internalError(w, "find claim for recreation", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	marker := fmt.Sprintf("spark-initiative:%s:%d", p.Key, session.GitHubID)
+	repo, access, err := a.github.Recreate(ctx, p, item.RepoName, session.Login, marker, session.GitHubID, item.RepoID)
+	if err != nil {
+		switch {
+		case errors.Is(err, errRepositoryChanged):
+			writeError(w, http.StatusConflict, "repository_changed", "repository no longer matches its claim")
+		case errors.Is(err, errRepoCollision):
+			writeError(w, http.StatusConflict, "repository_name_taken", "repository name is already in use")
+		case errors.Is(err, errIdentityChanged):
+			writeError(w, http.StatusConflict, "login_changed", "GitHub account identity changed; contact an organizer")
+		default:
+			a.upstreamError(w, "recreate repository", err)
+		}
+		return
+	}
+	if err := a.store.Complete(r.Context(), session.GitHubID, p.Key, repo, access.InvitationURL); err != nil {
+		a.internalError(w, "complete recreated claim", err)
+		return
+	}
+	status := "ready"
+	if access.Pending {
+		status = "awaiting_acceptance"
+	}
+	item.RepoID, item.RepoURL, item.InvitationURL = repo.ID, repo.HTMLURL, access.InvitationURL
+	writeJSON(w, http.StatusOK, map[string]any{
+		"claim": claimView(item, status),
+	})
+}
+
+func (a *application) validEmptyMutation(w http.ResponseWriter, r *http.Request, rawSession string) bool {
+	if !a.validMutation(r, rawSession) {
+		writeError(w, http.StatusForbidden, "csrf_failed", "invalid request origin or CSRF token")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	body, err := io.ReadAll(r.Body)
+	if err != nil || strings.TrimSpace(string(body)) != "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "request body must be empty")
+		return false
+	}
+	return true
 }
 
 func (a *application) validMutation(r *http.Request, rawSession string) bool {

@@ -22,6 +22,7 @@ type claim struct {
 
 type claimStore interface {
 	Reserve(context.Context, int64, string, phase) (claim, error)
+	Find(context.Context, int64, string) (claim, error)
 	List(context.Context, int64) ([]claim, error)
 	Complete(context.Context, int64, string, repository, string) error
 }
@@ -56,14 +57,14 @@ func (s *mysqlStore) Reserve(ctx context.Context, githubID int64, login string, 
 	if err != nil {
 		return claim{}, fmt.Errorf("reserve claim: %w", err)
 	}
-	item, err := s.get(ctx, githubID, p.Key)
+	item, err := s.Find(ctx, githubID, p.Key)
 	if errors.Is(err, sql.ErrNoRows) {
 		return claim{}, errClaimConflict
 	}
 	return item, err
 }
 
-func (s *mysqlStore) get(ctx context.Context, githubID int64, phaseKey string) (claim, error) {
+func (s *mysqlStore) Find(ctx context.Context, githubID int64, phaseKey string) (claim, error) {
 	var item claim
 	err := s.db.QueryRowContext(ctx, `
 		SELECT github_id, phase, github_login, repo_name,

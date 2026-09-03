@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -128,6 +129,132 @@ func TestProvisionRecoversGeneratedRepositoryByMarker(t *testing.T) {
 	}
 	if repo.ID != 91 || repo.Description != marker || access.Pending {
 		t.Errorf("repository = %#v, grant = %#v", repo, access)
+	}
+}
+
+func TestRecreateDeletesMatchingRepositoryBeforeProvisioning(t *testing.T) {
+	const marker = "spark-claim:42:rust"
+	want := []string{
+		"POST /app/installations/7/access_tokens",
+		"GET /repos/camp/course-alice",
+		"DELETE /repos/camp/course-alice",
+		"POST /repos/template-owner/template/generate",
+		"PUT /repos/camp/course-alice/collaborators/alice",
+	}
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		index := len(requests) - 1
+		if index >= len(want) || requests[index] != want[index] {
+			t.Errorf("request %d = %q", index+1, requests[index])
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		switch index {
+		case 0:
+			writeTestJSON(w, http.StatusCreated, map[string]any{"token": "installation-token"})
+		case 1:
+			writeTestJSON(w, http.StatusOK, map[string]any{
+				"id": 91, "name": "course-alice", "html_url": "https://github.test/camp/course-alice", "description": marker,
+			})
+		case 2:
+			w.WriteHeader(http.StatusNoContent)
+		case 3:
+			writeTestJSON(w, http.StatusCreated, map[string]any{
+				"id": 92, "name": "course-alice", "html_url": "https://github.test/camp/course-alice", "description": marker,
+			})
+		case 4:
+			writeTestJSON(w, http.StatusCreated, map[string]any{
+				"id": 12, "html_url": "https://github.test/invitation/12", "invitee": map[string]any{"id": 42},
+			})
+		}
+	}))
+	defer server.Close()
+
+	client := testGitHubClient(t, server)
+	repo, access, err := client.Recreate(context.Background(), phase{
+		TemplateOwner: "template-owner", TemplateRepo: "template",
+	}, "course-alice", "alice", marker, 42, 91)
+	if err != nil {
+		t.Fatalf("Recreate: %v", err)
+	}
+	if len(requests) != len(want) || repo.ID != 92 || !access.Pending {
+		t.Fatalf("requests = %#v, repository = %#v, grant = %#v", requests, repo, access)
+	}
+}
+
+func TestRecreateRejectsRepositoryThatNoLongerMatchesClaim(t *testing.T) {
+	const marker = "spark-claim:42:rust"
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch len(requests) {
+		case 1:
+			writeTestJSON(w, http.StatusCreated, map[string]any{"token": "installation-token"})
+		case 2:
+			writeTestJSON(w, http.StatusOK, map[string]any{
+				"id": 777, "name": "course-alice", "html_url": "https://github.test/camp/course-alice", "description": marker,
+			})
+		default:
+			t.Errorf("unexpected destructive request: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	client := testGitHubClient(t, server)
+	_, _, err := client.Recreate(context.Background(), phase{
+		TemplateOwner: "template-owner", TemplateRepo: "template",
+	}, "course-alice", "alice", marker, 42, 91)
+	if !errors.Is(err, errRepositoryChanged) {
+		t.Fatalf("Recreate error = %v, want %v", err, errRepositoryChanged)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %#v; repository should not have been deleted", requests)
+	}
+}
+
+func TestRecreateRebuildsRepositoryAlreadyDeletedFromGitHub(t *testing.T) {
+	const marker = "spark-claim:42:rust"
+	want := []string{
+		"POST /app/installations/7/access_tokens",
+		"GET /repos/camp/course-alice",
+		"POST /repos/template-owner/template/generate",
+		"PUT /repos/camp/course-alice/collaborators/alice",
+	}
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		index := len(requests) - 1
+		if index >= len(want) || requests[index] != want[index] {
+			t.Errorf("request %d = %q", index+1, requests[index])
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		switch index {
+		case 0:
+			writeTestJSON(w, http.StatusCreated, map[string]any{"token": "installation-token"})
+		case 1:
+			w.WriteHeader(http.StatusNotFound)
+		case 2:
+			writeTestJSON(w, http.StatusCreated, map[string]any{
+				"id": 92, "name": "course-alice", "html_url": "https://github.test/camp/course-alice", "description": marker,
+			})
+		case 3:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer server.Close()
+
+	client := testGitHubClient(t, server)
+	repo, _, err := client.Recreate(context.Background(), phase{
+		TemplateOwner: "template-owner", TemplateRepo: "template",
+	}, "course-alice", "alice", marker, 42, 91)
+	if err != nil {
+		t.Fatalf("Recreate: %v", err)
+	}
+	if len(requests) != len(want) || repo.ID != 92 {
+		t.Fatalf("requests = %#v, repository = %#v", requests, repo)
 	}
 }
 

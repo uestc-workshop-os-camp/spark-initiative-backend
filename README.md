@@ -20,6 +20,8 @@ OS Camp 2026 的极简仓库领取服务。它只做 GitHub Classroom 中仍然�
 
 没有 worker、队列或后台任务。GitHub 暂时失败时接口返回可重试错误；重试使用相同仓库名。若上一次生成成功但响应丢失，服务会按仓库名和 description marker 找回仓库。已经完成的领取直接从 MySQL 返回，不再请求 GitHub。
 
+已完成的仓库可以重新创建。若 GitHub 上的原仓库仍存在，服务会先核对仓库 ID、名称和 description marker，再删除并从模板重建；若原仓库已经删除，则直接重建。成功后，新的仓库 ID、地址和邀请链接会覆盖原领取记录。
+
 ## HTTP 接口
 
 所有路径都位于 `/api/classroom/v1`：
@@ -30,8 +32,10 @@ OS Camp 2026 的极简仓库领取服务。它只做 GitHub Classroom 中仍然�
 - `GET /state`
 - `POST /claim/rust`
 - `POST /claim/rcore`
+- `POST /claim/rust/recreate`
+- `POST /claim/rcore/recreate`
 
-`GET /state` 返回当前用户、阶段开关、领取结果和 `csrf_token`。两个 POST 接口需要同源 `Origin` 和 `X-CSRF-Token`，领取接口的 body 必须为空。
+`GET /state` 返回当前用户、阶段开关、领取结果和 `csrf_token`。所有 POST 接口都需要同源 `Origin` 和 `X-CSRF-Token`，领取及重新创建接口的 body 必须为空。
 
 OAuth state、PKCE verifier 和 30 分钟登录会话都保存在签名、`Secure`、`HttpOnly`、`SameSite=Lax` Cookie 中。GitHub user token 只用于读取 `/user`，不会保存。
 

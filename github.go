@@ -23,8 +23,9 @@ import (
 )
 
 var (
-	errRepoCollision   = errors.New("repository name already exists")
-	errIdentityChanged = errors.New("GitHub invitation points to another account")
+	errRepoCollision     = errors.New("repository name already exists")
+	errRepositoryChanged = errors.New("repository no longer matches its claim")
+	errIdentityChanged   = errors.New("GitHub invitation points to another account")
 )
 
 type githubUser struct {
@@ -48,6 +49,7 @@ type githubService interface {
 	AuthorizationURL(string, string, string) string
 	ExchangeUser(context.Context, string, string, string) (githubUser, error)
 	Provision(context.Context, phase, string, string, string, int64) (repository, grant, error)
+	Recreate(context.Context, phase, string, string, string, int64, int64) (repository, grant, error)
 }
 
 type githubClient struct {
@@ -138,22 +140,52 @@ func (g *githubClient) Provision(ctx context.Context, p phase, name, login, mark
 	if err != nil {
 		return repository{}, grant{}, err
 	}
+	return g.provisionWithToken(ctx, token, p, name, login, marker, expectedID)
+}
+
+func (g *githubClient) Recreate(ctx context.Context, p phase, name, login, marker string, expectedUserID, expectedRepoID int64) (repository, grant, error) {
+	token, err := g.installationToken(ctx)
+	if err != nil {
+		return repository{}, grant{}, err
+	}
+	existing, found, err := g.getRepository(ctx, token, name)
+	if err != nil {
+		return repository{}, grant{}, err
+	}
+	if found {
+		if existing.ID != expectedRepoID || existing.Name != name || existing.Description != marker {
+			return repository{}, grant{}, errRepositoryChanged
+		}
+		if err := g.deleteRepository(ctx, token, name); err != nil {
+			return repository{}, grant{}, err
+		}
+	}
+	return g.provisionWithToken(ctx, token, p, name, login, marker, expectedUserID)
+}
+
+func (g *githubClient) provisionWithToken(ctx context.Context, token string, p phase, name, login, marker string, expectedID int64) (repository, grant, error) {
 	repo, createErr := g.generateRepository(ctx, token, p, name, marker)
 	if createErr != nil {
-		var found bool
-		repo, found, err = g.getRepository(ctx, token, name)
+		recovered, found, err := g.getRepository(ctx, token, name)
 		if err != nil {
 			return repository{}, grant{}, err
 		}
 		if !found {
 			return repository{}, grant{}, createErr
 		}
+		repo = recovered
 	}
 	if repo.Description != marker {
 		return repository{}, grant{}, errRepoCollision
 	}
 	access, err := g.grant(ctx, token, name, login, expectedID)
 	return repo, access, err
+}
+
+func (g *githubClient) deleteRepository(ctx context.Context, token, name string) error {
+	path := "/repos/" + url.PathEscape(g.org) + "/" + url.PathEscape(name)
+	_, err := g.api(ctx, http.MethodDelete, path, token, nil, nil, http.StatusNoContent, http.StatusNotFound)
+	return err
 }
 
 func (g *githubClient) grant(ctx context.Context, token, repoName, login string, expectedID int64) (grant, error) {

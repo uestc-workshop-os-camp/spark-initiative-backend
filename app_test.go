@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,14 @@ func (s *fakeStore) Reserve(_ context.Context, id int64, login string, p phase) 
 	return item, nil
 }
 
+func (s *fakeStore) Find(_ context.Context, _ int64, phaseKey string) (claim, error) {
+	item, ok := s.claims[phaseKey]
+	if !ok {
+		return claim{}, sql.ErrNoRows
+	}
+	return item, nil
+}
+
 func (s *fakeStore) List(context.Context, int64) ([]claim, error) {
 	items := make([]claim, 0, len(s.claims))
 	for _, item := range s.claims {
@@ -45,6 +54,9 @@ type fakeGitHub struct {
 	authState, authChallenge, authRedirect string
 	provisionLogin                         string
 	provisionCalls                         int
+	recreateName, recreateLogin            string
+	recreateUserID, recreateRepoID         int64
+	recreateCalls                          int
 }
 
 func (g *fakeGitHub) AuthorizationURL(state, challenge, redirect string) string {
@@ -60,6 +72,13 @@ func (g *fakeGitHub) Provision(_ context.Context, _ phase, _, login, _ string, _
 	g.provisionCalls++
 	g.provisionLogin = login
 	return repository{ID: 99, HTMLURL: "https://github.test/org/repo"}, grant{}, nil
+}
+
+func (g *fakeGitHub) Recreate(_ context.Context, _ phase, name, login, _ string, userID, repoID int64) (repository, grant, error) {
+	g.recreateCalls++
+	g.recreateName, g.recreateLogin = name, login
+	g.recreateUserID, g.recreateRepoID = userID, repoID
+	return repository{ID: 101, HTMLURL: "https://github.test/org/recreated"}, grant{Pending: true, InvitationURL: "https://github.test/invitation/12"}, nil
 }
 
 func testApplication(enabled bool) (*application, *fakeStore, *fakeGitHub) {
@@ -172,6 +191,48 @@ func TestClaimRejectsClosedPhaseAndBadCSRF(t *testing.T) {
 	}
 }
 
+func TestRecreateReplacesCompletedClaim(t *testing.T) {
+	app, store, github := testApplication(true)
+	store.claims["rust"] = claim{
+		GitHubID: 42, Phase: "rust", GitHubLogin: "alice", RepoName: "rust-alice",
+		RepoID: 99, RepoURL: "https://github.test/org/rust-alice",
+	}
+	raw := sessionValue(t, app)
+	recorder := httptest.NewRecorder()
+	app.handler().ServeHTTP(recorder, recreateRequest(app, raw, "rust"))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if github.recreateCalls != 1 || github.recreateName != "rust-alice" || github.recreateLogin != "alice" {
+		t.Fatalf("unexpected recreate call: %#v", github)
+	}
+	if github.recreateUserID != 42 || github.recreateRepoID != 99 {
+		t.Fatalf("recreate IDs = user %d repo %d", github.recreateUserID, github.recreateRepoID)
+	}
+	item := store.claims["rust"]
+	if item.RepoID != 101 || item.RepoURL != "https://github.test/org/recreated" || item.InvitationURL != "https://github.test/invitation/12" {
+		t.Fatalf("claim was not replaced: %#v", item)
+	}
+}
+
+func TestRecreateRejectsIncompleteClaim(t *testing.T) {
+	app, store, github := testApplication(true)
+	store.claims["rust"] = claim{
+		GitHubID: 42, Phase: "rust", GitHubLogin: "alice", RepoName: "rust-alice",
+	}
+	raw := sessionValue(t, app)
+	recorder := httptest.NewRecorder()
+	app.handler().ServeHTTP(recorder, recreateRequest(app, raw, "rust"))
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if github.recreateCalls != 0 {
+		t.Fatalf("Recreate calls = %d, want 0", github.recreateCalls)
+	}
+}
+
 func sessionValue(t *testing.T, app *application) string {
 	t.Helper()
 	raw, err := app.signer.seal(sessionCookie{GitHubID: 42, Login: "alice", Expires: app.now().Add(time.Minute).Unix()})
@@ -183,6 +244,14 @@ func sessionValue(t *testing.T, app *application) string {
 
 func claimRequest(app *application, raw, phase string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, basePath+"/claim/"+phase, nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: raw})
+	req.Header.Set("Origin", app.cfg.PublicURL)
+	req.Header.Set("X-CSRF-Token", app.signer.csrf(raw))
+	return req
+}
+
+func recreateRequest(app *application, raw, phase string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, basePath+"/claim/"+phase+"/recreate", nil)
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: raw})
 	req.Header.Set("Origin", app.cfg.PublicURL)
 	req.Header.Set("X-CSRF-Token", app.signer.csrf(raw))
