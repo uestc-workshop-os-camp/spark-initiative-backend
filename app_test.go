@@ -3,17 +3,21 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
 
 type fakeStore struct {
-	claims       map[string]claim
-	reserveCalls int
+	claims         map[string]claim
+	reserveCalls   int
+	markReadyCalls int
 }
 
 func (s *fakeStore) Reserve(_ context.Context, id int64, login string, p phase) (claim, error) {
@@ -50,6 +54,14 @@ func (s *fakeStore) Complete(_ context.Context, _ int64, key string, repo reposi
 	return nil
 }
 
+func (s *fakeStore) MarkReady(_ context.Context, _ int64, key string) error {
+	s.markReadyCalls++
+	item := s.claims[key]
+	item.InvitationURL = ""
+	s.claims[key] = item
+	return nil
+}
+
 type fakeGitHub struct {
 	authState, authChallenge, authRedirect string
 	provisionLogin                         string
@@ -57,6 +69,8 @@ type fakeGitHub struct {
 	recreateName, recreateLogin            string
 	recreateUserID, recreateRepoID         int64
 	recreateCalls                          int
+	collaborator, collaboratorErr          bool
+	collaboratorCalls                      int
 }
 
 func (g *fakeGitHub) AuthorizationURL(state, challenge, redirect string) string {
@@ -79,6 +93,14 @@ func (g *fakeGitHub) Recreate(_ context.Context, _ phase, name, login, _ string,
 	g.recreateName, g.recreateLogin = name, login
 	g.recreateUserID, g.recreateRepoID = userID, repoID
 	return repository{ID: 101, HTMLURL: "https://github.test/org/recreated"}, grant{Pending: true, InvitationURL: "https://github.test/invitation/12"}, nil
+}
+
+func (g *fakeGitHub) IsCollaborator(context.Context, string, string) (bool, error) {
+	g.collaboratorCalls++
+	if g.collaboratorErr {
+		return false, errors.New("GitHub unavailable")
+	}
+	return g.collaborator, nil
 }
 
 func testApplication(enabled bool) (*application, *fakeStore, *fakeGitHub) {
@@ -157,6 +179,85 @@ func TestClaimRetriesWithCurrentLogin(t *testing.T) {
 	}
 	if github.provisionLogin != "alice" {
 		t.Fatalf("Provision login = %q, want current login", github.provisionLogin)
+	}
+}
+
+func TestStateReconcilesPendingInvitation(t *testing.T) {
+	tests := []struct {
+		name              string
+		accepted          bool
+		wantStatus        string
+		wantInvitationURL string
+		wantMarkReady     int
+	}{
+		{"still pending", false, "awaiting_acceptance", "https://github.test/invitation/8", 0},
+		{"accepted", true, "ready", "", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app, store, github := testApplication(true)
+			store.claims["rust"] = claim{
+				GitHubID: 42, Phase: "rust", GitHubLogin: "alice", RepoName: "rust-alice",
+				RepoID: 99, RepoURL: "https://github.test/org/rust-alice",
+				InvitationURL: "https://github.test/invitation/8",
+			}
+			github.collaborator = tt.accepted
+			raw := sessionValue(t, app)
+			recorder := httptest.NewRecorder()
+			app.handler().ServeHTTP(recorder, stateRequest(raw))
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			var payload struct {
+				Phases []struct {
+					Key   string `json:"key"`
+					Claim *struct {
+						Status        string `json:"status"`
+						InvitationURL string `json:"invitation_url"`
+					} `json:"claim"`
+				} `json:"phases"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Phases[0].Claim == nil || payload.Phases[0].Claim.Status != tt.wantStatus || payload.Phases[0].Claim.InvitationURL != tt.wantInvitationURL {
+				t.Fatalf("claim = %#v", payload.Phases[0].Claim)
+			}
+			if github.collaboratorCalls != 1 || store.markReadyCalls != tt.wantMarkReady {
+				t.Fatalf("collaborator calls = %d, mark ready calls = %d", github.collaboratorCalls, store.markReadyCalls)
+			}
+			if store.claims["rust"].InvitationURL != tt.wantInvitationURL {
+				t.Fatalf("stored invitation URL = %q", store.claims["rust"].InvitationURL)
+			}
+			if tt.accepted {
+				second := httptest.NewRecorder()
+				app.handler().ServeHTTP(second, stateRequest(raw))
+				if second.Code != http.StatusOK || github.collaboratorCalls != 1 {
+					t.Fatalf("second state status = %d, collaborator calls = %d", second.Code, github.collaboratorCalls)
+				}
+			}
+		})
+	}
+}
+
+func TestStateKeepsPendingStatusWhenGitHubCheckFails(t *testing.T) {
+	app, store, github := testApplication(true)
+	store.claims["rust"] = claim{
+		GitHubID: 42, Phase: "rust", GitHubLogin: "alice", RepoName: "rust-alice",
+		RepoID: 99, RepoURL: "https://github.test/org/rust-alice",
+		InvitationURL: "https://github.test/invitation/8",
+	}
+	github.collaboratorErr = true
+	raw := sessionValue(t, app)
+	recorder := httptest.NewRecorder()
+	app.handler().ServeHTTP(recorder, stateRequest(raw))
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"status":"awaiting_acceptance"`) {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if store.markReadyCalls != 0 {
+		t.Fatalf("mark ready calls = %d", store.markReadyCalls)
 	}
 }
 
@@ -247,6 +348,12 @@ func claimRequest(app *application, raw, phase string) *http.Request {
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: raw})
 	req.Header.Set("Origin", app.cfg.PublicURL)
 	req.Header.Set("X-CSRF-Token", app.signer.csrf(raw))
+	return req
+}
+
+func stateRequest(raw string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, basePath+"/state", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: raw})
 	return req
 }
 

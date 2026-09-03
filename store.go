@@ -25,6 +25,7 @@ type claimStore interface {
 	Find(context.Context, int64, string) (claim, error)
 	List(context.Context, int64) ([]claim, error)
 	Complete(context.Context, int64, string, repository, string) error
+	MarkReady(context.Context, int64, string) error
 }
 
 type mysqlStore struct{ db *sql.DB }
@@ -104,5 +105,13 @@ func (s *mysqlStore) Complete(ctx context.Context, githubID int64, phaseKey stri
 		SET repo_id = ?, repo_url = ?, invitation_url = ?, completed_at = ?
 		WHERE github_id = ? AND phase = ?`,
 		repo.ID, repo.HTMLURL, invitationURL, time.Now().Unix(), githubID, phaseKey)
+	return err
+}
+
+func (s *mysqlStore) MarkReady(ctx context.Context, githubID int64, phaseKey string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE spark_repo_claims
+		SET invitation_url = ''
+		WHERE github_id = ? AND phase = ?`, githubID, phaseKey)
 	return err
 }

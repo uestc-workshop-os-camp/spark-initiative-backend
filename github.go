@@ -50,6 +50,7 @@ type githubService interface {
 	ExchangeUser(context.Context, string, string, string) (githubUser, error)
 	Provision(context.Context, phase, string, string, string, int64) (repository, grant, error)
 	Recreate(context.Context, phase, string, string, string, int64, int64) (repository, grant, error)
+	IsCollaborator(context.Context, string, string) (bool, error)
 }
 
 type githubClient struct {
@@ -161,6 +162,19 @@ func (g *githubClient) Recreate(ctx context.Context, p phase, name, login, marke
 		}
 	}
 	return g.provisionWithToken(ctx, token, p, name, login, marker, expectedUserID)
+}
+
+func (g *githubClient) IsCollaborator(ctx context.Context, repoName, login string) (bool, error) {
+	token, err := g.installationToken(ctx)
+	if err != nil {
+		return false, err
+	}
+	path := "/repos/" + url.PathEscape(g.org) + "/" + url.PathEscape(repoName) + "/collaborators/" + url.PathEscape(login)
+	status, err := g.api(ctx, http.MethodGet, path, token, nil, nil, http.StatusNoContent, http.StatusNotFound)
+	if err != nil {
+		return false, err
+	}
+	return status == http.StatusNoContent, nil
 }
 
 func (g *githubClient) provisionWithToken(ctx context.Context, token string, p phase, name, login, marker string, expectedID int64) (repository, grant, error) {

@@ -150,15 +150,32 @@ func (a *application) state(w http.ResponseWriter, r *http.Request, session sess
 	for _, item := range claims {
 		byPhase[item.Phase] = item
 	}
+	reconcileCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
 	views := make([]any, 0, 2)
 	for _, key := range []string{"rust", "rcore"} {
 		p := a.cfg.Phases[key]
 		view := map[string]any{"key": p.Key, "title": p.Title, "enabled": p.Enabled}
 		if item, exists := byPhase[key]; exists {
-			view["claim"] = claimView(item, "completed")
-			if item.RepoURL == "" {
-				view["claim"] = claimView(item, "retry_required")
+			status := "ready"
+			switch {
+			case item.RepoURL == "":
+				status = "retry_required"
+			case item.InvitationURL != "":
+				status = "awaiting_acceptance"
+				accepted, checkErr := a.github.IsCollaborator(reconcileCtx, item.RepoName, item.GitHubLogin)
+				if checkErr != nil {
+					a.logger.Warn("check GitHub collaborator", "phase", item.Phase, "error", checkErr)
+				} else if accepted {
+					if err := a.store.MarkReady(r.Context(), session.GitHubID, item.Phase); err != nil {
+						a.internalError(w, "mark claim ready", err)
+						return
+					}
+					item.InvitationURL = ""
+					status = "ready"
+				}
 			}
+			view["claim"] = claimView(item, status)
 		}
 		views = append(views, view)
 	}
@@ -191,7 +208,11 @@ func (a *application) claim(w http.ResponseWriter, r *http.Request, session sess
 		return
 	}
 	if item.RepoID > 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"claim": claimView(item, "completed")})
+		status := "ready"
+		if item.InvitationURL != "" {
+			status = "awaiting_acceptance"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"claim": claimView(item, status)})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)

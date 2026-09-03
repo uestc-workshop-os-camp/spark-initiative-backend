@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 )
@@ -255,6 +256,50 @@ func TestRecreateRebuildsRepositoryAlreadyDeletedFromGitHub(t *testing.T) {
 	}
 	if len(requests) != len(want) || repo.ID != 92 {
 		t.Fatalf("requests = %#v, repository = %#v", requests, repo)
+	}
+}
+
+func TestIsCollaborator(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		want   bool
+	}{
+		{"accepted", http.StatusNoContent, true},
+		{"pending", http.StatusNotFound, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests = append(requests, r.Method+" "+r.URL.Path)
+				switch len(requests) {
+				case 1:
+					writeTestJSON(w, http.StatusCreated, map[string]any{"token": "installation-token"})
+				case 2:
+					w.WriteHeader(tt.status)
+				default:
+					http.Error(w, "unexpected request", http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+
+			client := testGitHubClient(t, server)
+			got, err := client.IsCollaborator(context.Background(), "course-alice", "alice")
+			if err != nil {
+				t.Fatalf("IsCollaborator: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("IsCollaborator = %v, want %v", got, tt.want)
+			}
+			wantRequests := []string{
+				"POST /app/installations/7/access_tokens",
+				"GET /repos/camp/course-alice/collaborators/alice",
+			}
+			if !slices.Equal(requests, wantRequests) {
+				t.Fatalf("requests = %#v, want %#v", requests, wantRequests)
+			}
+		})
 	}
 }
 
