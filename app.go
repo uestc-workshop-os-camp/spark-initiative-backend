@@ -63,7 +63,8 @@ func (a *application) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expires := a.now().Add(10 * time.Minute)
-	value, err := a.signer.seal(oauthCookie{state, verifier, expires.Unix()})
+	returnTo := safeReturnTo(r.URL.Query().Get("return_to"))
+	value, err := a.signer.seal(oauthCookie{state, verifier, returnTo, expires.Unix()})
 	if err != nil {
 		a.internalError(w, "sign OAuth cookie", err)
 		return
@@ -85,8 +86,9 @@ func (a *application) callback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_oauth", "login session is invalid or expired")
 		return
 	}
+	returnTo := safeReturnTo(saved.ReturnTo)
 	if r.URL.Query().Get("error") != "" {
-		http.Redirect(w, r, "/os/?auth=denied", http.StatusFound)
+		http.Redirect(w, r, returnTo+"?auth=denied", http.StatusFound)
 		return
 	}
 	code := r.URL.Query().Get("code")
@@ -100,7 +102,7 @@ func (a *application) callback(w http.ResponseWriter, r *http.Request) {
 	user, err := a.github.ExchangeUser(ctx, code, saved.Verifier, redirect)
 	if err != nil {
 		a.logger.Warn("GitHub login failed", "error", err)
-		http.Redirect(w, r, "/os/?auth=failed", http.StatusFound)
+		http.Redirect(w, r, returnTo+"?auth=failed", http.StatusFound)
 		return
 	}
 	expires := a.now().Add(30 * time.Minute)
@@ -113,7 +115,14 @@ func (a *application) callback(w http.ResponseWriter, r *http.Request) {
 		Name: sessionCookieName, Value: value, Path: basePath + "/",
 		Expires: expires, MaxAge: 1800, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	})
-	http.Redirect(w, r, "/os/", http.StatusFound)
+	http.Redirect(w, r, returnTo, http.StatusFound)
+}
+
+func safeReturnTo(value string) string {
+	if value == "/rdma/" {
+		return value
+	}
+	return "/os/"
 }
 
 type sessionHandler func(http.ResponseWriter, *http.Request, sessionCookie, string)
@@ -152,9 +161,12 @@ func (a *application) state(w http.ResponseWriter, r *http.Request, session sess
 	}
 	reconcileCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	views := make([]any, 0, 2)
-	for _, key := range []string{"rust", "rcore"} {
-		p := a.cfg.Phases[key]
+	views := make([]any, 0, 3)
+	for _, key := range []string{"rust", "rcore", "rdma"} {
+		p, exists := a.cfg.Phases[key]
+		if !exists {
+			continue
+		}
 		view := map[string]any{"key": p.Key, "title": p.Title, "enabled": p.Enabled}
 		if item, exists := byPhase[key]; exists {
 			status := "ready"

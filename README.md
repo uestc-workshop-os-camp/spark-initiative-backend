@@ -1,6 +1,6 @@
 # spark-initiative-backend
 
-OS Camp 2026 的极简仓库领取服务。它只做 GitHub Classroom 中仍然需要的部分：学员登录 GitHub，然后为 Rust 和 rCore 各领取一个组织内仓库。
+Spark Initiative 2026 的极简仓库领取服务。它只做 GitHub Classroom 中仍然需要的部分：学员登录 GitHub，然后领取 Rust、rCore 或 RDMA101 的组织内仓库。
 
 它不负责课程内容、CI、评分或排行榜。现有 `os_camp_be` 继续独立扫描 GitHub 仓库；两个服务不调用彼此，也不共享数据表。
 
@@ -10,6 +10,7 @@ OS Camp 2026 的极简仓库领取服务。它只做 GitHub Classroom 中仍然�
 | --- | --- | --- | --- |
 | Rust | `rustling-2026-template` | `rcore-rustlings-2026-{login}` | 默认分支 |
 | rCore | `rCore-Camp-Code-2026` | `rcore-camp-2026-{login}` | 全部分支 |
+| RDMA101 | `rdma101-labs` | `rdma-camp-2026-{login}` | 默认分支 |
 
 领取是同步操作：
 
@@ -32,8 +33,10 @@ OS Camp 2026 的极简仓库领取服务。它只做 GitHub Classroom 中仍然�
 - `GET /state`
 - `POST /claim/rust`
 - `POST /claim/rcore`
+- `POST /claim/rdma`
 - `POST /claim/rust/recreate`
 - `POST /claim/rcore/recreate`
+- `POST /claim/rdma/recreate`
 
 `GET /state` 返回当前用户、阶段开关、领取结果和 `csrf_token`。所有 POST 接口都需要同源 `Origin` 和 `X-CSRF-Token`，领取及重新创建接口的 body 必须为空。
 
@@ -41,7 +44,7 @@ OAuth state、PKCE verifier 和 30 分钟登录会话都保存在签名、`Secur
 
 ## MySQL
 
-服务只创建并使用 `spark_repo_claims`。可以与排行榜使用同一个 MySQL database；它不会读取或修改旧服务的 `phase1_user_info`、`phase2_user_info`。
+服务只创建并使用 `spark_repo_claims`。可以与排行榜使用同一个 MySQL database；它不会读取或修改排行榜的 `phase1_user_info`、`phase2_user_info`、`rdma_user_info`。
 
 部署时先由管理员执行 [schema.sql](schema.sql)。程序启动时不会修改表结构；服务账号只需要该表的 `SELECT`、`INSERT` 和 `UPDATE` 权限。
 
@@ -54,7 +57,7 @@ OAuth state、PKCE verifier 和 30 分钟登录会话都保存在签名、`Secur
 - Organization / Account permissions：不需要
 - Webhook：不需要
 - 安装目标：`uestc-workshop-os-camp`
-- Repository access：只选择两个模板仓库
+- Repository access：选择 `rustling-2026-template`、`rCore-Camp-Code-2026` 和 `rdma101-labs` 三个模板仓库
 
 Callback URL：
 
@@ -84,11 +87,12 @@ CGO_ENABLED=0 go build -trimpath -o spark-initiative-backend .
 
 程序只允许监听 loopback，生产环境由同域 HTTPS Nginx 转发 `/api/classroom/v1/`。OAuth callback 的 access log 不应记录 query string，因为其中含有一次性 `code` 和 `state`。
 
-两个阶段默认关闭。模板和邀请流程验证完毕后，分别设置：
+三个阶段默认关闭。模板和邀请流程验证完毕后，分别设置：
 
 ```text
 SPARK_RUST_ENABLED=true
 SPARK_RCORE_ENABLED=true
+SPARK_RDMA_ENABLED=true
 ```
 
 ## 与旧排行榜的契约
@@ -97,5 +101,6 @@ SPARK_RCORE_ENABLED=true
 
 - `rcore-rustlings-2026-` 前缀由旧服务识别为 Rust。
 - `rcore-camp-2026-` 前缀由旧服务识别为 rCore。
+- `rdma-camp-2026-` 前缀由旧服务识别为 RDMA101。
 
-课程模板中的 CI 继续把 `latest.json` 和成绩文本写到各仓库的 `gh-pages` 数据分支；不需要启用 GitHub Pages。
+课程模板中的 grader 把 `latest.json` 和成绩文本写到各仓库的专用数据分支；OS 模板沿用 `gh-pages`，RDMA 模板使用 `grades`，均不需要启用 GitHub Pages。

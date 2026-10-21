@@ -83,9 +83,14 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("SPARK_RCORE_TEMPLATE: %w", err)
 	}
+	rdmaOwner, rdmaRepo, err := splitRepo(envDefault("SPARK_RDMA_TEMPLATE", cfg.GitHubOrg+"/rdma101-labs"))
+	if err != nil {
+		return cfg, fmt.Errorf("SPARK_RDMA_TEMPLATE: %w", err)
+	}
 	cfg.Phases = map[string]phase{
 		"rust":  {"rust", "Rust", rustOwner, rustRepo, "rcore-rustlings-2026-", false, envBool("SPARK_RUST_ENABLED")},
 		"rcore": {"rcore", "rCore", rcoreOwner, rcoreRepo, "rcore-camp-2026-", true, envBool("SPARK_RCORE_ENABLED")},
+		"rdma":  {"rdma", "RDMA101", rdmaOwner, rdmaRepo, "rdma-camp-2026-", false, envBool("SPARK_RDMA_ENABLED")},
 	}
 	return cfg, nil
 }

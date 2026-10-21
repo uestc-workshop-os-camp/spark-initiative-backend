@@ -64,6 +64,7 @@ func (s *fakeStore) MarkReady(_ context.Context, _ int64, key string) error {
 
 type fakeGitHub struct {
 	authState, authChallenge, authRedirect string
+	provisionPhase                         phase
 	provisionLogin                         string
 	provisionCalls                         int
 	recreateName, recreateLogin            string
@@ -82,8 +83,9 @@ func (*fakeGitHub) ExchangeUser(context.Context, string, string, string) (github
 	return githubUser{ID: 42, Login: "alice"}, nil
 }
 
-func (g *fakeGitHub) Provision(_ context.Context, _ phase, _, login, _ string, _ int64) (repository, grant, error) {
+func (g *fakeGitHub) Provision(_ context.Context, p phase, _, login, _ string, _ int64) (repository, grant, error) {
 	g.provisionCalls++
+	g.provisionPhase = p
 	g.provisionLogin = login
 	return repository{ID: 99, HTMLURL: "https://github.test/org/repo"}, grant{}, nil
 }
@@ -110,6 +112,10 @@ func testApplication(enabled bool) (*application, *fakeStore, *fakeGitHub) {
 		Phases: map[string]phase{
 			"rust":  {Key: "rust", Title: "Rust", Prefix: "rust-", Enabled: enabled},
 			"rcore": {Key: "rcore", Title: "rCore", Prefix: "rcore-", Enabled: enabled},
+			"rdma": {
+				Key: "rdma", Title: "RDMA101", TemplateOwner: "camp",
+				TemplateRepo: "rdma101-labs", Prefix: "rdma-camp-2026-", Enabled: enabled,
+			},
 		},
 	}
 	store, github := &fakeStore{claims: make(map[string]claim)}, &fakeGitHub{}
@@ -141,8 +147,66 @@ func TestLoginSetsStateAndPKCECookie(t *testing.T) {
 	if saved.State == "" || saved.Verifier == "" || github.authState != saved.State {
 		t.Fatalf("state/verifier not preserved: %#v", saved)
 	}
+	if saved.ReturnTo != "/os/" {
+		t.Fatalf("return path = %q, want /os/", saved.ReturnTo)
+	}
 	if github.authChallenge != pkceChallenge(saved.Verifier) || github.authRedirect != "https://camp.test"+basePath+"/auth/callback" {
 		t.Fatalf("unexpected authorization arguments: %#v", github)
+	}
+}
+
+func TestLoginAcceptsOnlyKnownReturnPath(t *testing.T) {
+	tests := []struct {
+		name, value, want string
+	}{
+		{"RDMA page", "/rdma/", "/rdma/"},
+		{"OS page", "/os/", "/os/"},
+		{"external URL", "https://evil.test/", "/os/"},
+		{"unknown local path", "/admin/", "/os/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app, _, _ := testApplication(true)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, basePath+"/auth/login?return_to="+tt.value, nil)
+			app.handler().ServeHTTP(recorder, request)
+
+			var saved oauthCookie
+			if err := app.signer.open(recorder.Result().Cookies()[0].Value, &saved); err != nil {
+				t.Fatal(err)
+			}
+			if saved.ReturnTo != tt.want {
+				t.Fatalf("return path = %q, want %q", saved.ReturnTo, tt.want)
+			}
+		})
+	}
+}
+
+func TestCallbackReturnsToSavedCoursePage(t *testing.T) {
+	app, _, _ := testApplication(true)
+	oauthValue, err := app.signer.seal(oauthCookie{
+		State: "state", Verifier: "verifier", ReturnTo: "/rdma/",
+		Expires: app.now().Add(time.Minute).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, basePath+"/auth/callback?state=state&code=code", nil)
+	request.AddCookie(&http.Cookie{Name: oauthCookieName, Value: oauthValue})
+	recorder := httptest.NewRecorder()
+	app.handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != "/rdma/" {
+		t.Fatalf("status = %d, location = %q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	foundSession := false
+	for _, cookie := range recorder.Result().Cookies() {
+		foundSession = foundSession || cookie.Name == sessionCookieName
+	}
+	if !foundSession {
+		t.Fatal("session cookie missing")
 	}
 }
 
@@ -162,6 +226,24 @@ func TestClaimIsIdempotent(t *testing.T) {
 	}
 	if store.claims["rust"].RepoID != 99 {
 		t.Fatalf("claim was not completed: %#v", store.claims["rust"])
+	}
+}
+
+func TestRdmaClaimUsesConfiguredTemplateAndPrefix(t *testing.T) {
+	app, store, github := testApplication(true)
+	raw := sessionValue(t, app)
+	recorder := httptest.NewRecorder()
+	app.handler().ServeHTTP(recorder, claimRequest(app, raw, "rdma"))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if github.provisionCalls != 1 || github.provisionPhase.Key != "rdma" ||
+		github.provisionPhase.TemplateOwner != "camp" || github.provisionPhase.TemplateRepo != "rdma101-labs" {
+		t.Fatalf("unexpected RDMA provision call: %#v", github)
+	}
+	if item := store.claims["rdma"]; item.RepoName != "rdma-camp-2026-alice" || item.RepoID != 99 {
+		t.Fatalf("RDMA claim = %#v", item)
 	}
 }
 

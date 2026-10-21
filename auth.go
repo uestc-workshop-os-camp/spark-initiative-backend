@@ -18,6 +18,7 @@ type signer struct {
 
 type oauthCookie struct {
 	State, Verifier string
+	ReturnTo        string `json:"return_to"`
 	Expires         int64
 }
 
